@@ -8,14 +8,28 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from groq import Groq
+from supabase import create_client, Client
 
-# Load environment variables
+# Load environment variables (only has effect locally - on Render these
+# come from the dashboard's Environment tab, not from a .env file)
 load_dotenv()
 groq_api_key = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key)
+
+# -----------------------------------------------------------------------------
+# Supabase client - this is the ONLY thing that makes state shared across
+# users. Supabase does not run this FastAPI app for you (it has no Python
+# hosting). It just gives you a Postgres database that every instance of
+# this backend can read from and write to, so all users see the same data.
+# -----------------------------------------------------------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # use the service_role key, not anon
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Name of the single table we use as a shared JSON store (see supabase_schema.sql)
+STATE_TABLE = "careflow_state"
 
 # The verified working model on your Groq account
 GROQ_MODEL = "openai/gpt-oss-20b"
@@ -110,6 +124,51 @@ beds: List[HospitalBed] = get_initial_beds()
 interleaved_counter: int = 0
 
 # -----------------------------------------------------------------------------
+# Shared-state helpers (Supabase-backed)
+# -----------------------------------------------------------------------------
+# The three globals above (waiting_patients, beds, interleaved_counter) still
+# hold the data that every function below reads and mutates - none of that
+# business logic changes. The only new rule is:
+#   - call load_state() at the START of any endpoint that reads them
+#   - call save_state() at the END of any endpoint that changes them
+# load_state() overwrites the globals with whatever the last request (from
+# ANY user, on ANY server instance) saved. save_state() pushes the current
+# globals back so the next request - from this user or anyone else - sees
+# the update. This is what makes "one user changes a patient, everyone
+# sees it" work, and it's also what survives Render's free tier putting
+# the whole process to sleep after 15 minutes of inactivity (in-memory
+# Python lists do not survive that; a row in Postgres does).
+def load_state():
+    global waiting_patients, beds, interleaved_counter
+    result = supabase.table(STATE_TABLE).select("data").eq("key", "state").execute()
+    if result.data:
+        payload = result.data[0]["data"]
+        waiting_patients = [Patient(**p) for p in payload.get("waiting_patients", [])]
+        beds = [HospitalBed(**b) for b in payload.get("beds", [])]
+        interleaved_counter = payload.get("interleaved_counter", 0)
+    else:
+        # Nothing saved yet (first ever run) - seed with defaults and persist them
+        waiting_patients = []
+        beds = get_initial_beds()
+        interleaved_counter = 0
+        save_state()
+
+def save_state():
+    global waiting_patients, beds, interleaved_counter
+    # model_dump(mode="json") turns datetimes/enums into plain JSON-safe values
+    payload = {
+        "waiting_patients": [p.model_dump(mode="json") for p in waiting_patients],
+        "beds": [b.model_dump(mode="json") for b in beds],
+        "interleaved_counter": interleaved_counter,
+    }
+    # upsert = insert the row if key="state" doesn't exist yet, otherwise overwrite it.
+    # Note: this is "last write wins" - if two users click a button in the same
+    # split second, one write can overwrite the other. Fine for a demo/small
+    # team tool; a real hospital system would need row-level updates instead
+    # of one big JSON blob, to avoid that.
+    supabase.table(STATE_TABLE).upsert({"key": "state", "data": payload}).execute()
+
+# -----------------------------------------------------------------------------
 # AI Clinical Intent & Triage Engine (Groq)
 # -----------------------------------------------------------------------------
 
@@ -171,19 +230,19 @@ def classify_patient_with_groq(data: IntakeRequest) -> tuple[Optional[OPDLane], 
 # -----------------------------------------------------------------------------
 # Interleaved Scheduling Engine
 # -----------------------------------------------------------------------------
-
 def calculate_interleaved_queue():
     global interleaved_counter
     now = datetime.now()
 
+    # 1. Separate patients by track and lane
     er_patients = [p for p in waiting_patients if p.track == DepartmentTrack.ER_WALKIN]
     opd_express = [p for p in waiting_patients if p.track == DepartmentTrack.OPD and p.opd_lane == OPDLane.EXPRESS]
     opd_comp = [p for p in waiting_patients if p.track == DepartmentTrack.OPD and p.opd_lane == OPDLane.COMPREHENSIVE]
 
-    # ER patients sorted by medical urgency
+    # 2. Critical ER Trauma always sorted to the top by medical priority
     er_patients.sort(key=lambda p: p.priority_score, reverse=True)
 
-    # Interleave OPD: 1 Comprehensive -> 1 Express -> 1 Comprehensive
+    # 3. Interleave OPD: 1 Comprehensive -> 1 Express -> 1 Comprehensive -> 1 Express
     interleaved_opd = []
     idx_e, idx_c = 0, 0
     while idx_e < len(opd_express) or idx_c < len(opd_comp):
@@ -193,32 +252,51 @@ def calculate_interleaved_queue():
         if idx_e < len(opd_express):
             interleaved_opd.append(opd_express[idx_e])
             idx_e += 1
-            interleaved_counter += 1
 
+    # Exact current interleaved slots (avoids infinite counter inflation)
+    interleaved_counter = min(len(opd_express), len(opd_comp))
+
+    # 4. Reconstruct Queue: ER Emergencies FIRST, then Interleaved OPD
     waiting_patients.clear()
     waiting_patients.extend(er_patients)
     waiting_patients.extend(interleaved_opd)
 
-    # Compute Dynamic ETAs
-    er_backlog = sum(b.time_remaining_min for b in beds if b.department == DepartmentTrack.ER_WALKIN)
-    opd_backlog = sum(b.time_remaining_min for b in beds if b.department == DepartmentTrack.OPD)
+    # 5. Compute Realistic Discrete Server ETAs
+    # Track when each bed will become free (in minutes from now)
+    er_bed_free_times = [
+        b.time_remaining_min if b.current_patient is not None else 0
+        for b in beds if b.department == DepartmentTrack.ER_WALKIN
+    ]
+    opd_bed_free_times = [
+        b.time_remaining_min if b.current_patient is not None else 0
+        for b in beds if b.department == DepartmentTrack.OPD
+    ]
 
     for p in waiting_patients:
         p.wait_time_minutes = max(0, int((now - p.arrival_time).total_seconds() // 60))
-        if p.track == DepartmentTrack.ER_WALKIN:
-            p.estimated_wait_min = int(er_backlog // 3)
-            er_backlog += p.estimated_duration_min
-        else:
-            p.estimated_wait_min = int(opd_backlog // 2)
-            opd_backlog += p.estimated_duration_min
 
+        if p.track == DepartmentTrack.ER_WALKIN:
+            # Patient gets the earliest bed that opens up
+            er_bed_free_times.sort()
+            earliest_available = er_bed_free_times[0]
+            p.estimated_wait_min = earliest_available
+            # That bed is now reserved by this patient for their estimated duration
+            er_bed_free_times[0] += p.estimated_duration_min
+        else:
+            # OPD patient gets the earliest consulting desk
+            opd_bed_free_times.sort()
+            earliest_available = opd_bed_free_times[0]
+            p.estimated_wait_min = earliest_available
+            opd_bed_free_times[0] += p.estimated_duration_min
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
 
 @app.get("/api/stats", response_model=CareFlowMetrics)
 def get_metrics():
+    load_state()
     calculate_interleaved_queue()
+    save_state()
     er_beds = [b for b in beds if b.department == DepartmentTrack.ER_WALKIN]
     er_occ = sum(1 for b in er_beds if b.current_patient is not None)
     opd_p = [p for p in waiting_patients if p.track == DepartmentTrack.OPD]
@@ -237,6 +315,7 @@ def get_metrics():
 
 @app.post("/api/triage", response_model=Patient)
 def admit_patient(data: IntakeRequest):
+    load_state()
     lane, duration, priority, reasoning = classify_patient_with_groq(data)
     patient = Patient(
         id=str(uuid.uuid4())[:8],
@@ -254,19 +333,24 @@ def admit_patient(data: IntakeRequest):
     )
     waiting_patients.append(patient)
     calculate_interleaved_queue()
+    save_state()
     return patient
 
 @app.get("/api/queue", response_model=List[Patient])
 def get_queue():
+    load_state()
     calculate_interleaved_queue()
+    save_state()
     return waiting_patients
 
 @app.get("/api/beds", response_model=List[HospitalBed])
 def get_beds():
+    load_state()
     return beds
 
 @app.post("/api/dispatch/assign")
 def auto_assign():
+    load_state()
     calculate_interleaved_queue()
     if not waiting_patients:
         return {"message": "Queue is empty."}
@@ -281,12 +365,15 @@ def auto_assign():
                     bed.current_patient = assigned
                     bed.time_remaining_min = assigned.estimated_duration_min
                     calculate_interleaved_queue()
+                    save_state()
                     return {"status": "assigned", "bed": bed.name, "patient": assigned.name, "track": p.track}
 
+    save_state()
     return {"message": "No compatible beds available."}
 
 @app.post("/api/beds/{bed_id}/discharge")
 def discharge_bed(bed_id: str):
+    load_state()
     for b in beds:
         if b.id == bed_id:
             if not b.current_patient:
@@ -296,14 +383,17 @@ def discharge_bed(bed_id: str):
             b.time_remaining_min = 0
             b.pending_discharge = False
             calculate_interleaved_queue()
+            save_state()
             return {"status": "discharged", "patient": name, "bed": b.name}
     raise HTTPException(status_code=404, detail="Bed not found.")
 
 @app.post("/api/beds/{bed_id}/flag-discharge")
 def flag_pending_discharge(bed_id: str):
+    load_state()
     for b in beds:
         if b.id == bed_id and b.current_patient:
             b.pending_discharge = True
+            save_state()
             return {"status": "flagged", "bed": b.name}
     raise HTTPException(status_code=404, detail="Bed not found or empty.")
 
@@ -398,9 +488,14 @@ def generate_random_patient():
 @app.post("/api/demo/reset")
 def reset_demo():
     global waiting_patients, beds, interleaved_counter
-    waiting_patients.clear()
+    waiting_patients = []
     beds = get_initial_beds()
     interleaved_counter = 0
+    # Push the clean slate to Supabase FIRST. If we called admit_patient()
+    # below before this, it would call load_state() and overwrite our
+    # reset with whatever was still saved from before - this ordering
+    # avoids that.
+    save_state()
 
     admit_patient(IntakeRequest(name="James Wilson", age=52, track=DepartmentTrack.OPD, chief_complaint="Comprehensive workup: Chronic joint swelling and persistent fatigue", mobility=MobilityStatus.AMBULATORY))
     admit_patient(IntakeRequest(name="Amina Khan", age=30, track=DepartmentTrack.OPD, chief_complaint="Routine blood report review and prescription refill", mobility=MobilityStatus.AMBULATORY))
@@ -408,7 +503,6 @@ def reset_demo():
 
     return {"status": "reset_complete"}
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def serve_dashboard():
-    with open("dashboard.html", "r", encoding="utf-8") as f:
-        return f.read()
+# NOTE: the old "/dashboard" route that read dashboard.html off disk has been
+# removed. The frontend is now deployed separately on GitHub Pages (see
+# deployment steps), so this backend only needs to serve the /api/* routes.
