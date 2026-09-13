@@ -3,29 +3,30 @@
 <head>
   <meta charset="UTF-8">
   <title>CareFlow AI — Intelligent Hospital Queue & Bed System</title>
-  <script src="https://cdn.tailwindcss.com">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
     async function triggerAction(endpoint, btnElement) {
-  const originalText = btnElement.innerText;
-  btnElement.innerText = "⏳ Loading...";
-  btnElement.disabled = true;
+      const originalText = btnElement.innerText;
+      btnElement.innerText = "⏳ Loading...";
+      btnElement.disabled = true;
 
-  try {
-    const res = await fetch(`${API_BASE}${endpoint}`, {
-      method: "POST"
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      console.error(`Action failed (${endpoint}):`, err);
+      try {
+        const res = await fetch(`${API_BASE}${endpoint}`, {
+          method: "POST"
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          console.error(`Action failed (${endpoint}):`, err);
+        }
+        await update();
+      } catch (err) {
+        console.error(`Network/CORS error on ${endpoint}:`, err);
+        alert(`Request failed: ${err.message}. Check browser console.`);
+      } finally {
+        btnElement.innerText = originalText;
+        btnElement.disabled = false;
+      }
     }
-    await update();
-  } catch (err) {
-    console.error(`Network/CORS error on ${endpoint}:`, err);
-    alert(`Request failed: ${err.message}. Check browser console.`);
-  } finally {
-    btnElement.innerText = originalText;
-    btnElement.disabled = false;
-  }
-}
   </script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <style>
@@ -205,7 +206,7 @@
     // instead of a relative path like '/api/stats'. Change this ONE line
     // after you deploy the backend on Render - everything else below
     // just uses API_BASE and does not need to change again.
-    const API_BASE = 'https://your-app-name.onrender.com';
+    const API_BASE = 'https://careflow-ai-i3u6.onrender.com';
 
     let currentQueue = [];
 
